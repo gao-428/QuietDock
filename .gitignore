@@ -1,0 +1,6 @@
+release/
+acceptance/
+*.exe
+*.zip
+*.log
+*.bak
