@@ -40,6 +40,10 @@ struct Entry {
     bool fixed = false;
     Gdiplus::Bitmap *image = nullptr;
     bool temporary = false;
+    // Auxiliary UI belongs to this window, never to every process of its host.
+    HWND window = nullptr;
+    DWORD windowPid = 0;
+    bool closeRequested = false;
 };
 HWND dock = nullptr, tip = nullptr, shadow = nullptr;
 bool inspectUi = false;
@@ -86,7 +90,18 @@ bool processStillAlive(const wstring &key) {
     return !items.empty();
 }
 std::map<wstring, std::vector<HWND>> systemWindows;
+std::vector<Entry> auxiliaryWindows;
+struct AuxiliaryCloseRequest {
+    Entry entry;
+    int attempts = 0;
+    ULONGLONG settleUntil = 0;
+    bool ownerWasMinimized = false;
+    wstring windowClass;
+};
+std::vector<AuxiliaryCloseRequest> auxiliaryCloseRequests;
 void refreshRunning();
+void cancelWindowActivation();
+bool windowActivationPending(HWND window);
 bool isRunning(int index);
 void updateGhost(float dt);
 void finishVerticalDrag(bool commit);
@@ -681,7 +696,7 @@ bool reorderEntry(int from, int to) {
 void saveRecentOrder() {
     if (!showRecent) return;
     std::vector<wstring> order;
-    for (const auto &entry : entries) if (entry.temporary) order.push_back(entry.path);
+    for (const auto &entry : entries) if (entry.temporary && !entry.window) order.push_back(entry.path);
     if (!order.empty() && order != recentPaths) {
         recentPaths = std::move(order);
         saveRecent();
@@ -834,7 +849,8 @@ void showName() {
     hideName();
     wstring label = hover < visibleCount() ? entries[hover].label :
                     L"更多入口";
-    if (hover < visibleCount() && entries[hover].temporary) label += L"（最近打开）";
+    if (hover < visibleCount() && entries[hover].temporary)
+        label += entries[hover].window ? L"（附属窗口）" : L"（最近打开）";
     HDC dc = GetDC(tip);
     auto old = SelectObject(dc, font);
     SIZE text{};
@@ -967,6 +983,7 @@ void positionDock() {
         [](const Entry &e) { return !e.temporary; }));
     SetPropW(dock, L"QuietDock.RecentEnabled", (HANDLE)(uintptr_t)showRecent);
     SetPropW(dock, L"QuietDock.RecentCount", (HANDLE)(uintptr_t)std::count_if(entries.begin(), entries.end(), [](const Entry &e) { return e.temporary; }));
+    SetPropW(dock, L"QuietDock.AuxiliaryCount", (HANDLE)(uintptr_t)std::count_if(entries.begin(), entries.end(), [](const Entry &e) { return e.window != nullptr; }));
     SetPropW(dock, L"QuietDock.Scale", (HANDLE)(uintptr_t)dockZoom);
     HMONITOR monitor = MonitorFromWindow(dock, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi{sizeof(mi)};
@@ -1152,6 +1169,60 @@ wstring canonicalExecutable(wstring value) {
     if (!value.empty()) CharLowerBuffW(value.data(), (DWORD)value.size());
     return value;
 }
+bool minimizedWindowOwner(HWND window) {
+    int depth = 0;
+    for (HWND owner = GetWindow(window, GW_OWNER); owner && depth++ < 16; owner = GetWindow(owner, GW_OWNER))
+        if (IsIconic(owner)) return true;
+    return false;
+}
+bool auxiliaryWindowAvailable(const Entry &entry) {
+    return IsWindowVisible(entry.window) || (!entry.closeRequested && minimizedWindowOwner(entry.window));
+}
+bool validAuxiliaryWindow(const Entry &entry, bool requireAvailable = true) {
+    DWORD pid = 0;
+    if (!entry.window || !IsWindow(entry.window) || (requireAvailable && !auxiliaryWindowAvailable(entry))) return false;
+    GetWindowThreadProcessId(entry.window, &pid);
+    if (pid != entry.windowPid) return false;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return false;
+    wchar_t path[32768]{}; DWORD length = 32768;
+    bool match = QueryFullProcessImageNameW(process, 0, path, &length) &&
+                 canonicalExecutable(path) == canonicalExecutable(entry.path);
+    CloseHandle(process);
+    return match;
+}
+void reconcileAuxiliaryCloseRequests() {
+    for (auto request = auxiliaryCloseRequests.begin(); request != auxiliaryCloseRequests.end();) {
+        wchar_t title[512]{}; GetWindowTextW(request->entry.window, title, 512);
+        if (!validAuxiliaryWindow(request->entry, false) ||
+            classOf(request->entry.window) != request->windowClass || request->entry.label != title) {
+            request = auxiliaryCloseRequests.erase(request); continue;
+        }
+        if (minimizedWindowOwner(request->entry.window)) {
+            request->ownerWasMinimized = true; ++request; continue;
+        }
+        if (request->ownerWasMinimized) {
+            request->ownerWasMinimized = false;
+            request->settleUntil = GetTickCount64() + 600;
+        }
+        // The first close was already posted. Give older asynchronous restore
+        // messages time to finish before spending the bounded cleanup retries.
+        if (GetTickCount64() < request->settleUntil) {
+            if (dock) SetTimer(dock, 5, 100, nullptr);
+            ++request; continue;
+        }
+        if (!IsWindowVisible(request->entry.window)) {
+            request = auxiliaryCloseRequests.erase(request); continue;
+        }
+        if (request->attempts >= 3) { request = auxiliaryCloseRequests.erase(request); continue; }
+        // An earlier async restore or an owner restore can show the popup
+        // after WM_CLOSE. Finish only this close request after those settle.
+        PostMessageW(request->entry.window, WM_CLOSE, 0, 0);
+        ++request->attempts;
+        if (dock) SetTimer(dock, 5, 100, nullptr);
+        ++request;
+    }
+}
 wstring entryExecutable(int index) {
     if (index < 0 || index >= (int)entries.size()) return L"";
     auto &path = entries[index].path;
@@ -1169,6 +1240,11 @@ wstring systemWindowKey(const Entry &entry) {
 }
 bool isRunning(int index) {
     if (index < 0 || index >= (int)entries.size()) return false;
+    if (entries[index].window) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(entries[index].window, &pid);
+        return pid == entries[index].windowPid && auxiliaryWindowAvailable(entries[index]);
+    }
     wstring key = systemWindowKey(entries[index]);
     if (!key.empty()) {
         auto found = systemWindows.find(key);
@@ -1273,8 +1349,18 @@ bool systemSurface(const wstring &path) {
         if (name == host) return true;
     return false;
 }
+bool auxiliarySurface(const wstring &path) {
+    wstring lower = canonicalExecutable(path);
+    // QQ Music embeds the same WMPF runtime as WeChat. Scope by installation
+    // path, and keep each window independent instead of killing a shared host.
+    return wstring(PathFindFileNameW(lower.c_str())) == L"wechatappex.exe" &&
+           lower.find(L"\\tencent\\") != wstring::npos &&
+           (lower.find(L"\\wmpf\\") != wstring::npos ||
+            lower.find(L"\\xplugin\\plugins\\radiumwmpf\\") != wstring::npos);
+}
 BOOL CALLBACK collectApplications(HWND window, LPARAM context) {
-    if (!IsWindowVisible(window) || GetWindow(window, GW_OWNER) ||
+    bool visible = IsWindowVisible(window) != FALSE;
+    if ((!visible && !minimizedWindowOwner(window)) ||
         (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) return TRUE;
     DWORD cloaked = 0;
     DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
@@ -1285,12 +1371,40 @@ BOOL CALLBACK collectApplications(HWND window, LPARAM context) {
     DWORD pid = 0;
     GetWindowThreadProcessId(window, &pid);
     if (pid == GetCurrentProcessId()) return TRUE;
+    if (std::any_of(auxiliaryCloseRequests.begin(), auxiliaryCloseRequests.end(), [&](const AuxiliaryCloseRequest &request) {
+        return request.entry.window == window && request.entry.windowPid == pid;
+    })) return TRUE;
+    // Windows hides owned popups when their owner is minimized. Retain only
+    // previously discovered pages, not all hidden helper/message windows.
+    if (!visible && std::none_of(entries.begin(), entries.end(), [&](const Entry &entry) {
+        return entry.window == window && entry.windowPid == pid && !entry.closeRequested;
+    })) return TRUE;
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!process) return TRUE;
     wchar_t path[32768]{};
     DWORD length = 32768;
     if (QueryFullProcessImageNameW(process, 0, path, &length)) {
         if (!systemSurface(path)) {
+            if (auxiliarySurface(path) || GetWindow(window, GW_OWNER)) {
+                // Ignore message/utility popups; keep real, titled auxiliary UI.
+                wchar_t title[512]{};
+                GetWindowTextW(window, title, 512);
+                LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+                LONG_PTR extended = GetWindowLongPtrW(window, GWL_EXSTYLE);
+                if (*title && !(extended & WS_EX_NOACTIVATE) &&
+                    ((style & WS_CAPTION) || (extended & WS_EX_APPWINDOW)))
+                {
+                    Entry candidate{title, path, nullptr, false, nullptr, true, window, pid};
+                    auto existing = std::find_if(entries.begin(), entries.end(), [&](const Entry &entry) {
+                        return entry.window == window && entry.windowPid == pid &&
+                               canonicalExecutable(entry.path) == canonicalExecutable(path);
+                    });
+                    if (existing != entries.end()) candidate.closeRequested = existing->closeRequested;
+                    auxiliaryWindows.push_back(candidate);
+                }
+                CloseHandle(process);
+                return TRUE;
+            }
             wstring host = applicationHost(path), key = canonicalExecutable(host);
             (*(std::map<wstring, wstring> *)context)[key] = host;
             trackProcess(key, pid);
@@ -1308,7 +1422,9 @@ void syncRecentEntries() {
         bool pinned = false;
         for (int i = 0; i < (int)entries.size(); ++i)
             if (!entries[i].temporary && entryExecutable(i) == key) { pinned = true; break; }
-        if (pinned || systemSurface(path)) continue;
+        // Older versions persisted web runtimes as ordinary recent programs.
+        // A closed auxiliary window must not consume a retained top-three slot.
+        if (pinned || systemSurface(path) || auxiliarySurface(path)) continue;
         auto running = runningProcesses.find(key);
         bool alive = processStillAlive(key) || (running != runningProcesses.end() && !running->second.empty());
         if (alive || (retained.size() < 3 && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES))
@@ -1319,27 +1435,56 @@ void syncRecentEntries() {
         recentPaths = retained;
         saveRecent();
     }
-    std::vector<wstring> desired = showRecent ? retained : std::vector<wstring>{};
+    std::vector<Entry> desired;
+    if (showRecent) {
+        for (const auto &path : retained)
+            desired.push_back({labelFor(path), path, nullptr, false, nullptr, true});
+        // Keep manual positions of surviving window entries without writing
+        // transient HWNDs or helper executables into recent.ini.
+        auto pending = auxiliaryWindows;
+        int slot = 0;
+        for (const auto &entry : entries) if (entry.temporary) {
+            if (entry.window) {
+                auto found = std::find_if(pending.begin(), pending.end(), [&](const Entry &candidate) {
+                    return candidate.window == entry.window && candidate.windowPid == entry.windowPid &&
+                           candidate.path == entry.path;
+                });
+                if (found != pending.end()) {
+                    desired.insert(desired.begin() + std::min(slot, (int)desired.size()), *found);
+                    pending.erase(found);
+                }
+            }
+            ++slot;
+        }
+        desired.insert(desired.begin(), pending.begin(), pending.end());
+    }
     std::stable_partition(entries.begin(), entries.end(), [](const Entry &e) { return !e.temporary; });
-    std::vector<wstring> current;
-    for (auto &e : entries) if (e.temporary) current.push_back(e.path);
-    if (current == desired) return;
+    std::vector<Entry> current;
+    for (const auto &e : entries) if (e.temporary) current.push_back(e);
+    if (current.size() == desired.size() && std::equal(current.begin(), current.end(), desired.begin(),
+        [](const Entry &a, const Entry &b) {
+            return a.path == b.path && a.window == b.window && a.windowPid == b.windowPid &&
+                   a.label == b.label && a.closeRequested == b.closeRequested;
+        })) return;
+    hideName();
     for (auto &e : entries) if (e.temporary) { DestroyIcon(e.icon); delete e.image; }
     entries.erase(std::remove_if(entries.begin(), entries.end(), [](const Entry &e) { return e.temporary; }), entries.end());
-    for (const auto &path : desired) {
-        entries.push_back({labelFor(path), path, nullptr, false, nullptr, true});
+    for (const auto &entry : desired) {
+        entries.push_back(entry);
         loadIcon(entries.back());
     }
     hover = -1;
     magnification.clear();
 }
 void refreshRunning() {
+    reconcileAuxiliaryCloseRequests();
     refreshSystemWindows();
     bool changed = false;
     bool stable = dragIndex < 0 && !dragReturning && !menuOpen;
     if (stable) {
         std::map<wstring, wstring> applications;
         visibleApplicationProcesses.clear();
+        auxiliaryWindows.clear();
         EnumWindows(collectApplications, (LPARAM)&applications);
         for (const auto &app : applications) {
             bool pinned = false;
@@ -1417,11 +1562,11 @@ void refreshRunning() {
         InvalidateRect(dock, nullptr, FALSE);
     }
     if (stable) {
-        std::vector<wstring> before;
-        for (const auto &e : entries) before.push_back(e.path);
+        std::vector<std::pair<wstring, HWND>> before;
+        for (const auto &e : entries) before.push_back({e.path, e.window});
         syncRecentEntries();
-        std::vector<wstring> after;
-        for (const auto &e : entries) after.push_back(e.path);
+        std::vector<std::pair<wstring, HWND>> after;
+        for (const auto &e : entries) after.push_back({e.path, e.window});
         changed = before != after;
     }
     if (changed && dock) {
@@ -1528,10 +1673,23 @@ void finishVerticalDrag(bool commit) {
     if (!verticalDrag) return;
     verticalDrag = false;
     if (commit && ghostEntry >= 0 && upwardDistance >= scale(64) && isRunning(ghostEntry)) {
+        bool restorePending = windowActivationPending(entries[ghostEntry].window);
+        cancelWindowActivation();
         wstring target = entryExecutable(ghostEntry);
         refreshRunning();
         wstring windowKey = systemWindowKey(entries[ghostEntry]);
-        if (!windowKey.empty()) {
+        if (entries[ghostEntry].window) {
+            if (validAuxiliaryWindow(entries[ghostEntry])) {
+                entries[ghostEntry].closeRequested = PostMessageW(entries[ghostEntry].window, WM_CLOSE, 0, 0) != FALSE;
+                if (entries[ghostEntry].closeRequested &&
+                    (restorePending || minimizedWindowOwner(entries[ghostEntry].window))) {
+                    Entry closed = entries[ghostEntry]; closed.icon = nullptr; closed.image = nullptr;
+                    wchar_t title[512]{}; GetWindowTextW(closed.window, title, 512); closed.label = title;
+                    auxiliaryCloseRequests.push_back({closed, 0, GetTickCount64() + 600,
+                                                     minimizedWindowOwner(closed.window), classOf(closed.window)});
+                }
+            }
+        } else if (!windowKey.empty()) {
             for (HWND window : systemWindows[windowKey])
                 if (IsWindow(window)) PostMessageW(window, WM_CLOSE, 0, 0);
         } else if (canonicalExecutable(PathFindFileNameW(target.c_str())) == L"steam.exe") {
@@ -1602,6 +1760,101 @@ BOOL CALLBACK findBrowserWindow(HWND window, LPARAM param) {
         search.window = window;
     return TRUE;
 }
+struct WindowActivation {
+    HWND window = nullptr;
+    DWORD pid = 0, inputTime = 0;
+    wstring windowClass;
+    int attempts = 0;
+    bool wasVisible = false;
+} pendingActivation;
+bool windowActivationPending(HWND window) {
+    return window && pendingActivation.window &&
+           (pendingActivation.window == window ||
+            GetAncestor(pendingActivation.window, GA_ROOTOWNER) == GetAncestor(window, GA_ROOTOWNER));
+}
+void cancelWindowActivation() {
+    if (dock) KillTimer(dock, 6);
+    pendingActivation = {};
+}
+bool tryWindowActivation() {
+    HWND selected = pendingActivation.window;
+    // A disabled owner can only receive input through its modal popup. Do not
+    // otherwise replace a specifically selected article with another page.
+    for (int depth = 0; depth < 16 && !IsWindowEnabled(selected); ++depth) {
+        HWND popup = GetLastActivePopup(selected);
+        if (!popup || popup == selected || !IsWindowVisible(popup)) break;
+        selected = popup;
+    }
+    std::vector<HWND> owners;
+    for (HWND owner = GetWindow(selected, GW_OWNER); owner && owners.size() < 16;
+         owner = GetWindow(owner, GW_OWNER)) owners.push_back(owner);
+    for (auto owner = owners.rbegin(); owner != owners.rend(); ++owner)
+        if (IsIconic(*owner)) ShowWindowAsync(*owner, SW_RESTORE);
+    if (IsIconic(selected)) ShowWindowAsync(selected, SW_RESTORE);
+    else if (!IsWindowVisible(selected)) ShowWindowAsync(selected, SW_SHOW);
+    SetWindowPos(selected, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    SetForegroundWindow(selected);
+    return GetForegroundWindow() == selected && IsWindowVisible(selected) && !IsIconic(selected) &&
+           std::none_of(owners.begin(), owners.end(), [](HWND owner) { return IsIconic(owner) != FALSE; });
+}
+void retryWindowActivation() {
+    if (!pendingActivation.window) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(pendingActivation.window, &pid);
+    if (pid != pendingActivation.pid || classOf(pendingActivation.window) != pendingActivation.windowClass) {
+        cancelWindowActivation();
+        return;
+    }
+    if (std::any_of(entries.begin(), entries.end(), [](const Entry &entry) {
+        return entry.window == pendingActivation.window && entry.windowPid == pendingActivation.pid && entry.closeRequested;
+    })) {
+        cancelWindowActivation();
+        return;
+    }
+    LASTINPUTINFO input{sizeof(input)};
+    HWND foreground = GetForegroundWindow();
+    if (GetLastInputInfo(&input) && input.dwTime != pendingActivation.inputTime &&
+        ((pendingActivation.wasVisible && !IsWindowVisible(pendingActivation.window)) ||
+         (foreground != dock && foreground != pendingActivation.window &&
+          GetAncestor(foreground, GA_ROOTOWNER) != GetAncestor(pendingActivation.window, GA_ROOTOWNER)))) {
+        cancelWindowActivation(); // A newer user action takes priority over this click.
+        return;
+    }
+    pendingActivation.wasVisible = pendingActivation.wasVisible || IsWindowVisible(pendingActivation.window);
+    if (tryWindowActivation()) {
+        if (dock) SetPropW(dock, L"QuietDock.ActivationSucceeded", (HANDLE)1);
+        cancelWindowActivation();
+    } else if (++pendingActivation.attempts >= 8) {
+        startupLog(L"activation: existing window did not become visible foreground hwnd=" +
+                   std::to_wstring((uintptr_t)pendingActivation.window));
+        FLASHWINFO flash{sizeof(flash), pendingActivation.window, FLASHW_TRAY, 2, 0};
+        FlashWindowEx(&flash);
+        cancelWindowActivation();
+    }
+}
+bool requestWindowActivation(HWND window) {
+    cancelWindowActivation();
+    if (!IsWindow(window)) return false;
+    auxiliaryCloseRequests.erase(std::remove_if(auxiliaryCloseRequests.begin(), auxiliaryCloseRequests.end(),
+        [&](const AuxiliaryCloseRequest &request) { return request.entry.window == window; }), auxiliaryCloseRequests.end());
+    HWND root = GetAncestor(window, GA_ROOT);
+    pendingActivation.window = root ? root : window;
+    GetWindowThreadProcessId(pendingActivation.window, &pendingActivation.pid);
+    pendingActivation.windowClass = classOf(pendingActivation.window);
+    pendingActivation.wasVisible = IsWindowVisible(pendingActivation.window) != FALSE;
+    LASTINPUTINFO input{sizeof(input)};
+    if (GetLastInputInfo(&input)) pendingActivation.inputTime = input.dwTime;
+    if (dock) {
+        SetPropW(dock, L"QuietDock.ActivationTarget", pendingActivation.window);
+        SetPropW(dock, L"QuietDock.ActivationSucceeded", nullptr);
+    }
+    retryWindowActivation();
+    // ShowWindowAsync and cross-thread activation complete in the target's
+    // message loop. Recheck briefly without blocking the Dock or sharing queues.
+    if (pendingActivation.window && dock) SetTimer(dock, 6, 60, nullptr);
+    return true;
+}
 bool activateExistingBrowser(const wstring &executable) {
     if (executable.empty())
         return false;
@@ -1609,14 +1862,7 @@ bool activateExistingBrowser(const wstring &executable) {
     EnumWindows(findBrowserWindow, (LPARAM)&search);
     if (!search.window)
         return false;
-    if (IsIconic(search.window))
-        ShowWindowAsync(search.window, SW_RESTORE);
-    else if (!IsWindowVisible(search.window))
-        ShowWindowAsync(search.window, SW_SHOW);
-    if (!SetForegroundWindow(search.window)) {
-        FLASHWINFO flash{sizeof(flash), search.window, FLASHW_TRAY, 2, 0};
-        FlashWindowEx(&flash);
-    }
+    requestWindowActivation(search.window);
     // A focus restriction must never turn a switch request into a new window.
     return true;
 }
@@ -1630,14 +1876,21 @@ void launch(int i) {
     openEntry(i);
 }
 void openEntry(int i) {
+    cancelWindowActivation();
     auto &e = entries[i];
+    if (e.window) {
+        if ((!e.closeRequested || IsWindowVisible(e.window)) && validAuxiliaryWindow(e, false)) {
+            e.closeRequested = false;
+            requestWindowActivation(e.window);
+        }
+        return;
+    }
     wstring key = systemWindowKey(e);
     if (!key.empty()) {
         refreshSystemWindows();
         for (HWND window : systemWindows[key]) {
             if (!IsWindow(window)) continue;
-            if (IsIconic(window)) ShowWindow(window, SW_RESTORE);
-            SetForegroundWindow(window);
+            requestWindowActivation(window);
             return;
         }
     }
@@ -1729,7 +1982,7 @@ void showMenu(POINT pt, int index) {
     HMENU m = CreatePopupMenu();
     if (index >= 0 && index < (int)entries.size()) {
         AppendMenuW(m, MF_STRING, 10, L"打开");
-        if (entries[index].temporary)
+        if (entries[index].temporary && !entries[index].window)
             AppendMenuW(m, MF_STRING, 16, L"固定到 Dock");
         if (!entries[index].fixed && !entries[index].temporary)
             AppendMenuW(m, MF_STRING, 11, L"移除此入口");
@@ -2111,6 +2364,7 @@ LRESULT CALLBACK windowProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         startIconAnimation();
         return 0;
     case WM_LBUTTONDOWN: {
+        cancelWindowActivation();
         if (dragReturning) {
             dragReturning = false;
             ghostEntry = -1;
@@ -2154,6 +2408,7 @@ LRESULT CALLBACK windowProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         dragIndex = -1;
         return 0;
     case WM_CONTEXTMENU: {
+        cancelWindowActivation();
         POINT screen{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, local = screen;
         if (screen.x == -1) {
             RECT r = itemRect(focusIndex);
@@ -2272,7 +2527,12 @@ LRESULT CALLBACK windowProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == 5) {
             KillTimer(h, 5);
             refreshRunning();
+            // Window-close notifications can arrive before the drag return
+            // animation ends. Retry promptly once list mutation is safe.
+            if (dragIndex >= 0 || dragReturning || menuOpen) SetTimer(h, 5, 100, nullptr);
         }
+        else if (wp == 6)
+            retryWindowActivation();
         return 0;
     case WM_APP + 5:
         SetTimer(h, 5, 100, nullptr);
@@ -2291,6 +2551,7 @@ LRESULT CALLBACK windowProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         DestroyWindow(h);
         return 0;
     case WM_DESTROY:
+        cancelWindowActivation();
         saveConfig();
         shutting = true;
         if (dragGhost) { DestroyWindow(dragGhost); dragGhost = nullptr; }
@@ -2349,6 +2610,9 @@ int writeDiagnostic(const wstring &path, bool selfTest) {
     text += L"loaded_items=" + std::to_wstring(current ? (uintptr_t)GetPropW(current, L"QuietDock.Items") : 0) + L"\r\n";
     text += L"recent_enabled=" + std::to_wstring(current ? (uintptr_t)GetPropW(current, L"QuietDock.RecentEnabled") : 0) + L"\r\n";
     text += L"recent_count=" + std::to_wstring(current ? (uintptr_t)GetPropW(current, L"QuietDock.RecentCount") : 0) + L"\r\n";
+    text += L"auxiliary_count=" + std::to_wstring(current ? (uintptr_t)GetPropW(current, L"QuietDock.AuxiliaryCount") : 0) + L"\r\n";
+    text += L"activation_target=" + std::to_wstring(current ? (uintptr_t)GetPropW(current, L"QuietDock.ActivationTarget") : 0) + L"\r\n";
+    text += L"activation_succeeded=" + std::to_wstring(current ? (uintptr_t)GetPropW(current, L"QuietDock.ActivationSucceeded") : 0) + L"\r\n";
     text += L"pinned_items=" + std::to_wstring(current ? (uintptr_t)GetPropW(current, L"QuietDock.Pinned") : 0) + L"\r\n";
     text += L"can_clean=" + std::to_wstring(current && GetPropW(current, L"QuietDock.CanClean")) +
             L"\r\n";
